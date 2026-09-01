@@ -7622,72 +7622,858 @@ class TestBranchPatternSlashSemantics:
 # ── Jira issue fetching tests ────────────────────────────────────────────────
 
 
-class TestAdfToPlainText:
-    """The ADF plain-text extractor handles Atlassian Document Format JSON."""
+class TestAdfToMarkdown:
+    """The ADF converter emits markdown for Atlassian Document Format JSON."""
+
+    @staticmethod
+    def _doc(*content):
+        return {"type": "doc", "version": 1, "content": list(content)}
+
+    @staticmethod
+    def _para(*content):
+        return {"type": "paragraph", "content": list(content)}
+
+    @staticmethod
+    def _text(text, marks=None):
+        node = {"type": "text", "text": text}
+        if marks is not None:
+            node["marks"] = marks
+        return node
 
     def test_simple_paragraph(self):
-        adf = {
-            "type": "doc",
-            "version": 1,
-            "content": [
+        adf = self._doc(self._para(self._text("Hello world")))
+        assert source._adf_to_markdown(adf) == "Hello world"
+
+    def test_multiple_paragraphs_separated_by_blank_line(self):
+        adf = self._doc(self._para(self._text("Line 1")), self._para(self._text("Line 2")))
+        assert source._adf_to_markdown(adf) == "Line 1\n\nLine 2"
+
+    def test_heading_becomes_hashes(self):
+        adf = self._doc(
+            {"type": "heading", "attrs": {"level": 3}, "content": [self._text("Title")]}
+        )
+        assert source._adf_to_markdown(adf) == "### Title"
+
+    def test_heading_level_is_clamped(self):
+        adf = self._doc(
+            {"type": "heading", "attrs": {"level": 99}, "content": [self._text("Deep")]}
+        )
+        assert source._adf_to_markdown(adf) == "###### Deep"
+
+    def test_heading_stays_on_one_line(self):
+        """Only a heading's first line carries the `#`, so a hardBreak inside it
+        would leave a second line whose `-` renders as a list."""
+        adf = self._doc(
+            {
+                "type": "heading",
+                "attrs": {"level": 3},
+                "content": [self._text("Title"), {"type": "hardBreak"}, self._text("- x")],
+            }
+        )
+        assert source._adf_to_markdown(adf) == "### Title - x"
+
+    def test_emphasis_marks(self):
+        adf = self._doc(
+            self._para(
+                self._text("bold", [{"type": "strong"}]),
+                self._text(" "),
+                self._text("italic", [{"type": "em"}]),
+                self._text(" "),
+                self._text("gone", [{"type": "strike"}]),
+            )
+        )
+        assert source._adf_to_markdown(adf) == "**bold** *italic* ~~gone~~"
+
+    def test_adjacent_identical_marks_are_merged(self):
+        """`**a****b**` renders as a bold `a****b` -- the delimiters become
+        content -- so equally marked neighbours must merge before wrapping."""
+        adf = self._doc(
+            self._para(
+                self._text("a", [{"type": "strong"}]),
+                self._text("b", [{"type": "strong"}]),
+            )
+        )
+        assert source._adf_to_markdown(adf) == "**ab**"
+
+    def test_adjacent_code_marks_are_merged(self):
+        """Worse than emphasis: `` `a``b` `` collapses into one span holding
+        literal backticks."""
+        adf = self._doc(
+            self._para(
+                self._text("a", [{"type": "code"}]),
+                self._text("b", [{"type": "code"}]),
+            )
+        )
+        assert source._adf_to_markdown(adf) == "`ab`"
+
+    def test_adjacent_different_marks_are_not_merged(self):
+        adf = self._doc(
+            self._para(
+                self._text("a", [{"type": "strong"}]),
+                self._text("b", [{"type": "em"}]),
+            )
+        )
+        assert source._adf_to_markdown(adf) == "**a***b*"
+
+    def test_an_italic_between_plain_neighbours_keeps_its_emphasis(self):
+        """CommonMark will not open underscore emphasis intraword, so `a_b_c`
+        would render with visible underscores and no italic."""
+        adf = self._doc(
+            self._para(
+                self._text("a"),
+                self._text("b", [{"type": "em"}]),
+                self._text("c"),
+            )
+        )
+        assert source._adf_to_markdown(adf) == "a*b*c"
+
+    def test_a_hard_break_keeps_marked_neighbours_apart(self):
+        adf = self._doc(
+            self._para(
+                self._text("a", [{"type": "strong"}]),
+                {"type": "hardBreak"},
+                self._text("b", [{"type": "strong"}]),
+            )
+        )
+        assert source._adf_to_markdown(adf) == "**a**  \n**b**"
+
+    def test_code_mark_is_literal_and_not_escaped(self):
+        adf = self._doc(self._para(self._text("a_b*c", [{"type": "code"}])))
+        assert source._adf_to_markdown(adf) == "`a_b*c`"
+
+    def test_code_span_keeps_its_boundary_spaces(self):
+        """CommonMark strips one space from each end of ` x `, so pad it."""
+        adf = self._doc(self._para(self._text(" foo ", [{"type": "code"}])))
+        assert source._adf_to_markdown(adf) == "`  foo  `"
+
+    def test_all_whitespace_code_span_is_not_padded(self):
+        """Whitespace-only content is exempt from the strip rule, so padding it
+        would silently add two spaces."""
+        adf = self._doc(self._para(self._text("   ", [{"type": "code"}])))
+        assert source._adf_to_markdown(adf) == "`   `"
+
+    def test_one_sided_space_in_a_code_span_is_not_padded(self):
+        adf = self._doc(self._para(self._text(" foo", [{"type": "code"}])))
+        assert source._adf_to_markdown(adf) == "` foo`"
+
+    def test_empty_marked_text_emits_nothing(self):
+        """A marked empty text node must not leave its bare delimiters behind."""
+        for mark in ("strong", "em", "strike", "code"):
+            adf = self._doc(self._para(self._text("", [{"type": mark}])))
+            assert source._adf_to_markdown(adf) == "", mark
+
+    def test_external_media_becomes_a_link_not_an_image(self):
+        """A link keeps the URL recoverable without the panel auto-fetching it."""
+        adf = self._doc(
+            self._para(
                 {
-                    "type": "paragraph",
-                    "content": [{"type": "text", "text": "Hello world"}],
+                    "type": "media",
+                    "attrs": {"type": "external", "url": "https://ex.com/a.png", "alt": "chart"},
                 }
+            )
+        )
+        assert source._adf_to_markdown(adf) == "[chart](https://ex.com/a.png)"
+
+    def test_media_without_a_url_contributes_nothing(self):
+        """An attachment reference carries no fetchable address."""
+        adf = self._doc(
+            self._para({"type": "media", "attrs": {"type": "file", "id": "abc", "alt": "shot"}})
+        )
+        assert source._adf_to_markdown(adf) == ""
+
+    def test_link_mark_keeps_the_url(self):
+        adf = self._doc(
+            self._para(
+                self._text(
+                    "the docs",
+                    [{"type": "link", "attrs": {"href": "https://example.com/a"}}],
+                )
+            )
+        )
+        assert source._adf_to_markdown(adf) == "[the docs](https://example.com/a)"
+
+    def test_link_with_parentheses_uses_the_angle_bracket_form(self):
+        adf = self._doc(
+            self._para(
+                self._text(
+                    "wiki",
+                    [{"type": "link", "attrs": {"href": "https://ex.com/a(b)"}}],
+                )
+            )
+        )
+        assert source._adf_to_markdown(adf) == "[wiki](<https://ex.com/a(b)>)"
+
+    def test_inline_card_becomes_a_link(self):
+        adf = self._doc(
+            self._para({"type": "inlineCard", "attrs": {"url": "https://example.com"}})
+        )
+        assert source._adf_to_markdown(adf) == "[https://example.com](https://example.com)"
+
+    def test_code_block_is_fenced_with_its_language(self):
+        adf = self._doc(
+            {
+                "type": "codeBlock",
+                "attrs": {"language": "python"},
+                "content": [self._text("print(1)\nprint(2)")],
+            }
+        )
+        assert source._adf_to_markdown(adf) == "```python\nprint(1)\nprint(2)\n```"
+
+    def test_code_block_fence_widens_past_inner_backticks(self):
+        adf = self._doc({"type": "codeBlock", "content": [self._text("a ``` b")]})
+        assert source._adf_to_markdown(adf) == "````\na ``` b\n````"
+
+    def test_code_block_language_cannot_leave_its_fence_line(self):
+        """A fence info string runs to end of line, so a newline in the
+        `language` attribute would close the fence and inject real markdown."""
+        adf = self._doc(
+            {
+                "type": "codeBlock",
+                "attrs": {"language": "python\n\n![x](https://evil.example/beacon.png)\n\n```"},
+                "content": [self._text("safe")],
+            }
+        )
+        result = source._adf_to_markdown(adf)
+        assert result == "```\nsafe\n```"
+        assert "evil.example" not in result
+
+    def test_code_block_keeps_a_real_language_token(self):
+        adf = self._doc(
+            {"type": "codeBlock", "attrs": {"language": "c++"}, "content": [self._text("x;")]}
+        )
+        assert source._adf_to_markdown(adf) == "```c++\nx;\n```"
+
+    def test_code_block_drops_a_multi_token_language(self):
+        adf = self._doc(
+            {
+                "type": "codeBlock",
+                "attrs": {"language": "python rm -rf"},
+                "content": [self._text("x")],
+            }
+        )
+        assert source._adf_to_markdown(adf) == "```\nx\n```"
+
+    def test_expand_title_stays_on_one_line(self):
+        adf = self._doc(
+            {
+                "type": "expand",
+                "attrs": {"title": "Details\n\n# Injected"},
+                "content": [self._para(self._text("inner"))],
+            }
+        )
+        assert source._adf_to_markdown(adf) == "**Details # Injected**\n\ninner"
+
+    def test_mention_name_stays_on_one_line(self):
+        adf = self._doc(self._para({"type": "mention", "attrs": {"text": "Alice\n# Injected"}}))
+        assert source._adf_to_markdown(adf) == "@Alice # Injected"
+
+    def test_bullet_list_gets_markers(self):
+        adf = self._doc(
+            {
+                "type": "bulletList",
+                "content": [
+                    {"type": "listItem", "content": [self._para(self._text("one"))]},
+                    {"type": "listItem", "content": [self._para(self._text("two"))]},
+                ],
+            }
+        )
+        assert source._adf_to_markdown(adf) == "- one\n- two"
+
+    def test_nested_list_is_indented_under_its_parent(self):
+        adf = self._doc(
+            {
+                "type": "bulletList",
+                "content": [
+                    {
+                        "type": "listItem",
+                        "content": [
+                            self._para(self._text("outer")),
+                            {
+                                "type": "bulletList",
+                                "content": [
+                                    {
+                                        "type": "listItem",
+                                        "content": [self._para(self._text("inner"))],
+                                    }
+                                ],
+                            },
+                        ],
+                    }
+                ],
+            }
+        )
+        assert source._adf_to_markdown(adf) == "- outer\n  - inner"
+
+    def test_ordered_list_honours_its_start_number(self):
+        adf = self._doc(
+            {
+                "type": "orderedList",
+                "attrs": {"order": 3},
+                "content": [
+                    {"type": "listItem", "content": [self._para(self._text("a"))]},
+                    {"type": "listItem", "content": [self._para(self._text("b"))]},
+                ],
+            }
+        )
+        assert source._adf_to_markdown(adf) == "3. a\n4. b"
+
+    def test_task_list_becomes_a_checklist(self):
+        adf = self._doc(
+            {
+                "type": "taskList",
+                "content": [
+                    {
+                        "type": "taskItem",
+                        "attrs": {"state": "DONE"},
+                        "content": [self._text("shipped")],
+                    },
+                    {
+                        "type": "taskItem",
+                        "attrs": {"state": "TODO"},
+                        "content": [self._text("pending")],
+                    },
+                ],
+            }
+        )
+        assert source._adf_to_markdown(adf) == "- [x] shipped\n- [ ] pending"
+
+    def test_blockquote_prefixes_every_line(self):
+        adf = self._doc(
+            {
+                "type": "blockquote",
+                "content": [self._para(self._text("first")), self._para(self._text("second"))],
+            }
+        )
+        assert source._adf_to_markdown(adf) == "> first\n>\n> second"
+
+    def test_panel_renders_as_a_blockquote(self):
+        adf = self._doc(
+            {
+                "type": "panel",
+                "attrs": {"panelType": "warning"},
+                "content": [self._para(self._text("careful"))],
+            }
+        )
+        assert source._adf_to_markdown(adf) == "> careful"
+
+    def test_rule_becomes_a_thematic_break(self):
+        adf = self._doc(self._para(self._text("a")), {"type": "rule"}, self._para(self._text("b")))
+        assert source._adf_to_markdown(adf) == "a\n\n---\n\nb"
+
+    def test_table_becomes_gfm(self):
+        adf = self._doc(
+            {
+                "type": "table",
+                "content": [
+                    {
+                        "type": "tableRow",
+                        "content": [
+                            {"type": "tableHeader", "content": [self._para(self._text("H1"))]},
+                            {"type": "tableHeader", "content": [self._para(self._text("H2"))]},
+                        ],
+                    },
+                    {
+                        "type": "tableRow",
+                        "content": [
+                            {"type": "tableCell", "content": [self._para(self._text("a"))]},
+                            {"type": "tableCell", "content": [self._para(self._text("b"))]},
+                        ],
+                    },
+                ],
+            }
+        )
+        assert source._adf_to_markdown(adf) == "| H1 | H2 |\n| --- | --- |\n| a | b |"
+
+    def test_short_table_row_emits_only_its_own_cells(self):
+        """GFM fills a short row itself, so padding it here buys nothing."""
+        adf = self._doc(
+            {
+                "type": "table",
+                "content": [
+                    {
+                        "type": "tableRow",
+                        "content": [
+                            {"type": "tableHeader", "content": [self._para(self._text("H1"))]},
+                            {"type": "tableHeader", "content": [self._para(self._text("H2"))]},
+                        ],
+                    },
+                    {
+                        "type": "tableRow",
+                        "content": [
+                            {"type": "tableCell", "content": [self._para(self._text("only"))]}
+                        ],
+                    },
+                ],
+            }
+        )
+        assert source._adf_to_markdown(adf) == "| H1 | H2 |\n| --- | --- |\n| only |"
+
+    def test_a_ragged_table_does_not_amplify_its_output(self):
+        """A wide header plus many narrow rows must stay linear in cell count."""
+        cells = 200
+        wide = {
+            "type": "tableRow",
+            "content": [
+                {"type": "tableHeader", "content": [self._para(self._text("h"))]}
+                for _ in range(cells)
             ],
         }
-        assert source._adf_to_plain_text(adf) == "Hello world\n"
+        narrow = [
+            {
+                "type": "tableRow",
+                "content": [{"type": "tableCell", "content": [self._para(self._text("c"))]}],
+            }
+            for _ in range(cells)
+        ]
+        rendered = source._adf_to_markdown(self._doc({"type": "table", "content": [wide, *narrow]}))
+        # 400 real cells. Padding every short row to the widest emits 200*200.
+        assert rendered.count("|") < 2000
 
-    def test_multiple_paragraphs(self):
-        adf = {
-            "type": "doc",
-            "version": 1,
-            "content": [
-                {"type": "paragraph", "content": [{"type": "text", "text": "Line 1"}]},
-                {"type": "paragraph", "content": [{"type": "text", "text": "Line 2"}]},
-            ],
-        }
-        assert source._adf_to_plain_text(adf) == "Line 1\nLine 2\n"
+    def test_mention_gets_an_at_prefix_without_doubling_it(self):
+        adf = self._doc(
+            self._para(
+                {"type": "mention", "attrs": {"text": "Alice"}},
+                self._text(" and "),
+                {"type": "mention", "attrs": {"text": "@Bob"}},
+            )
+        )
+        assert source._adf_to_markdown(adf) == "@Alice and @Bob"
 
-    def test_inline_card_extracts_url(self):
-        adf = {
-            "type": "doc",
-            "version": 1,
-            "content": [
+    def test_hard_break_is_a_markdown_line_break(self):
+        adf = self._doc(self._para(self._text("a"), {"type": "hardBreak"}, self._text("b")))
+        assert source._adf_to_markdown(adf) == "a  \nb"
+
+    def test_literal_markdown_in_text_is_escaped(self):
+        adf = self._doc(self._para(self._text("**not bold** and <b>tag</b> and _u_")))
+        result = source._adf_to_markdown(adf)
+        assert result == r"\*\*not bold\*\* and \<b\>tag\</b\> and \_u\_"
+
+    def test_literal_html_entity_in_text_is_escaped(self):
+        """rehypeRaw would otherwise decode `&copy;` to a copyright sign."""
+        adf = self._doc(self._para(self._text("&copy; 2026 &amp; friends")))
+        assert source._adf_to_markdown(adf) == r"\&copy; 2026 \&amp; friends"
+
+    def test_a_credential_in_text_is_redacted_by_the_converter_itself(self):
+        secret = "Ab3Df6Hj9Kl2Np5Qr8Tv1Wx4Yz7Bc0Ef3Gh6"
+        adf = self._doc(self._para(self._text(f"use ghp_{secret} to clone")))
+        assert secret not in source._adf_to_markdown(adf)
+
+    def test_a_credential_in_an_attribute_is_redacted_inside_the_bounded_walk(self):
+        """`_adf_attr_label` redacts before it escapes.
+
+        Escaping would insert a backslash into `ghp_...` and hide it from the
+        payload-level redactor that runs afterwards, and doing this inside the
+        converter's depth-capped traversal is what avoids an unbounded pre-pass
+        over a provider-controlled tree.
+        """
+        secret = "Ab3Df6Hj9Kl2Np5Qr8Tv1Wx4Yz7Bc0Ef3Gh6"
+        adf = self._doc(
+            self._para(
                 {
-                    "type": "paragraph",
+                    "type": "media",
+                    "attrs": {
+                        "type": "external",
+                        "url": "https://ex.com/a.png",
+                        "alt": f"use ghp_{secret}",
+                    },
+                }
+            )
+        )
+        assert secret not in source._adf_to_markdown(adf)
+
+    def test_a_credential_split_across_marked_siblings_is_still_redacted(self):
+        """A plain-text walk joins sibling text nodes seamlessly, so the payload
+        redactor catches a credential spanning them. Marks would put delimiters
+        between the halves and hide it, so an inline run whose own raw text
+        carries a credential is emitted as one redacted string."""
+        head, tail = "ghp_Ab3Df6Hj9Kl2Np5Qr8Tv1Wx4", "Yz7Bc0Ef3Gh6"
+        adf = self._doc(
+            self._para(self._text(head), self._text(tail, [{"type": "strong"}]))
+        )
+        rendered = source._adf_to_markdown(source._redact_provider_data(adf))
+        assert tail not in rendered
+        assert head not in rendered
+
+    def test_redacting_a_run_keeps_every_node_s_text(self):
+        """The fallback emits the plain rendition of the WHOLE run, so a mention
+        or card in the same paragraph keeps its text instead of disappearing."""
+        secret = "ghp_Ab3Df6Hj9Kl2Np5Qr8Tv1Wx4Yz7Bc0Ef3Gh6"
+        adf = self._doc(
+            self._para(
+                self._text(f"token {secret} for "),
+                {"type": "mention", "attrs": {"text": "Alice"}},
+                self._text(" see "),
+                {"type": "inlineCard", "attrs": {"url": "https://example.com/doc"}},
+            )
+        )
+        rendered = source._adf_to_markdown(adf)
+        assert secret not in rendered
+        assert "Alice" in rendered
+        assert "https://example.com/doc" in rendered
+
+    def test_a_credential_split_across_a_label_boundary_is_redacted(self):
+        """An emoji label contributes text with no delimiter of its own, so a
+        secret continued inside one is contiguous in the rendered output."""
+        head, tail = "ghp_Ab3Df6Hj9Kl2Np5Qr8Tv1Wx4", "Yz7Bc0Ef3Gh6"
+        adf = self._doc(
+            self._para(self._text(head), {"type": "emoji", "attrs": {"text": tail}})
+        )
+        rendered = source._adf_to_markdown(adf)
+        assert head not in rendered
+        assert tail not in rendered
+
+    def test_a_credential_split_through_an_unknown_container_is_redacted(self):
+        """An unrecognised inline container emits nothing of its own, so a
+        plain-text walk joined the halves either side of it seamlessly. It has to
+        stay inside the span the credential check reads."""
+        head, tail = "ghp_Ab3Df6Hj9Kl2Np5Qr8Tv1Wx4", "Yz7Bc0Ef3Gh6"
+        adf = self._doc(
+            self._para(
+                self._text(head),
+                {"type": "someFutureInline", "content": [self._text(tail)]},
+            )
+        )
+        rendered = source._adf_to_markdown(adf)
+        assert head not in rendered
+        assert tail not in rendered
+
+    def test_literal_math_syntax_is_escaped(self):
+        """The same renderer runs remark-math, so a literal `$$x$$` would
+        otherwise render as KaTeX instead of as the characters typed."""
+        adf = self._doc(self._para(self._text("costs $$5 and $x$ too")))
+        assert source._adf_to_markdown(adf) == r"costs \$\$5 and \$x\$ too"
+
+    def test_a_credential_split_inside_an_unknown_container_is_redacted(self):
+        """Both halves inside the container, the second one marked."""
+        head, tail = "ghp_Ab3Df6Hj9Kl2Np5Qr8Tv1Wx4", "Yz7Bc0Ef3Gh6"
+        adf = self._doc(
+            self._para(
+                {
+                    "type": "someFutureInline",
+                    "content": [self._text(head), self._text(tail, [{"type": "strong"}])],
+                }
+            )
+        )
+        rendered = source._adf_to_markdown(adf)
+        assert head not in rendered
+        assert tail not in rendered
+
+    def test_adjacent_identical_marks_inside_an_unknown_container_are_merged(self):
+        adf = self._doc(
+            self._para(
+                {
+                    "type": "someFutureInline",
                     "content": [
-                        {"type": "inlineCard", "attrs": {"url": "https://example.com"}},
+                        self._text("a", [{"type": "strong"}]),
+                        self._text("b", [{"type": "strong"}]),
                     ],
                 }
-            ],
+            )
+        )
+        assert source._adf_to_markdown(adf) == "**ab**"
+
+    def test_a_literal_bang_cannot_splice_an_image_onto_a_link(self):
+        """`!` before an emitted `[` would form image syntax, and an image
+        auto-fetches the URL -- the exact beacon the media-as-link form avoids."""
+        adf = self._doc(
+            self._para(
+                self._text("!"),
+                {
+                    "type": "media",
+                    "attrs": {"type": "external", "url": "https://evil.example/beacon.png"},
+                },
+            )
+        )
+        rendered = source._adf_to_markdown(adf)
+        assert rendered == r"\![https://evil.example/beacon.png](https://evil.example/beacon.png)"
+
+    def test_a_wide_run_of_text_nodes_merges_in_one_pass(self):
+        """Only traversal DEPTH is capped, so a provider can put hundreds of
+        thousands of adjacent text nodes in one paragraph. The run's text is
+        joined once rather than rebuilt per node."""
+        n = 100000
+        adf = self._doc(
+            {"type": "paragraph", "content": [{"type": "text", "text": "a"} for _ in range(n)]}
+        )
+        assert source._adf_to_markdown(adf) == "a" * n
+
+    def test_a_credential_split_deep_inside_nested_containers_is_redacted(self):
+        """The scan runs once at the outermost run and inner containers reuse it,
+        so the guarantee has to hold at depth, not just at the top level."""
+        head, tail = "ghp_Ab3Df6Hj9Kl2Np5Qr8Tv1Wx4", "Yz7Bc0Ef3Gh6"
+        node = {
+            "type": "someFutureInline",
+            "content": [self._text(head), self._text(tail, [{"type": "strong"}])],
         }
-        assert "https://example.com" in source._adf_to_plain_text(adf)
+        for _ in range(3):
+            node = {"type": "someFutureInline", "content": [node]}
+        rendered = source._adf_to_markdown(self._doc(self._para(node)))
+        assert head not in rendered
+        assert tail not in rendered
+
+    def test_a_media_alt_cannot_join_adjacent_text(self):
+        """A media node emits `[alt](url)`, so its label is always bracketed and
+        cannot continue a credential started in the text before it."""
+        head, tail = "ghp_Ab3Df6Hj9Kl2Np5Qr8Tv1Wx4", "Yz7Bc0Ef3Gh6"
+        adf = self._doc(
+            self._para(
+                self._text(head),
+                {
+                    "type": "media",
+                    "attrs": {"type": "external", "url": "https://ex.com/a.png", "alt": tail},
+                },
+            )
+        )
+        rendered = source._adf_to_markdown(adf)
+        assert (head + tail) not in rendered.replace("\\", "")
+        assert f"[{tail}](https://ex.com/a.png)" in rendered
+
+    def test_line_leading_list_marker_in_text_is_escaped(self):
+        adf = self._doc(self._para(self._text("- not a list")), self._para(self._text("1. nor this")))
+        assert source._adf_to_markdown(adf) == "\\- not a list\n\n1\\. nor this"
+
+    def test_a_setext_underline_in_text_cannot_promote_the_line_above(self):
+        """A line of `=` or `-` under a paragraph line makes it a heading, so both
+        underline characters have to be escaped, not just the list-marker one."""
+        adf = self._doc(self._para(self._text("Title\n===")), self._para(self._text("Sub\n---")))
+        assert source._adf_to_markdown(adf) == "Title\n\\===\n\nSub\n\\---"
+
+    def test_pipe_in_a_table_cell_is_escaped(self):
+        adf = self._doc(
+            {
+                "type": "table",
+                "content": [
+                    {
+                        "type": "tableRow",
+                        "content": [
+                            {
+                                "type": "tableHeader",
+                                "content": [self._para(self._text("a|b"))],
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+        assert source._adf_to_markdown(adf).startswith("| a\\|b |")
+
+    def test_line_expansion_guard_refuses_a_projected_overflow(self):
+        """Per-line expansion is checked by projection, before any allocation."""
+        many = "x\n" * 100000
+        with pytest.raises(source.SourceProviderError):
+            source._md_guard_line_expansion(many, 120)
+        # The same text with a two-character indent projects well under the cap.
+        source._md_guard_line_expansion(many, 2)
+
+    def test_deeply_nested_quotes_over_the_ceiling_are_refused_not_rendered(self):
+        """Newlines inside one text node cost ~3 payload bytes each while 60
+        levels of nesting adds 120 characters to every one, so a small document
+        can project past the payload ceiling. It must raise, not allocate."""
+        inner = {"type": "paragraph", "content": [{"type": "text", "text": "x\n" * 100000}]}
+        node = {"type": "blockquote", "content": [inner]}
+        for _ in range(59):
+            node = {"type": "blockquote", "content": [node]}
+        with pytest.raises(source.SourceProviderError):
+            source._adf_to_markdown(self._doc(node))
+
+    def test_nested_blockquotes_get_one_marker_per_level(self):
+        """A chain of single-child quotes is prefixed in one pass, so the marker
+        count must still match the nesting depth."""
+        node = {"type": "blockquote", "content": [self._para(self._text("deep"))]}
+        for _ in range(2):
+            node = {"type": "blockquote", "content": [node]}
+        assert source._adf_to_markdown(self._doc(node)) == "> > > deep"
+
+    def test_code_span_whitespace_survives_cell_flattening(self):
+        """A cell is folded to one line by collapsing NEWLINES only -- a code
+        span's repeated spaces are literal content."""
+        adf = self._doc(
+            {
+                "type": "table",
+                "content": [
+                    {
+                        "type": "tableRow",
+                        "content": [
+                            {
+                                "type": "tableHeader",
+                                "content": [
+                                    self._para(self._text("a  b", [{"type": "code"}]))
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+        assert source._adf_to_markdown(adf).startswith("| `a  b` |")
+
+    def test_pipe_inside_a_code_span_in_a_cell_is_escaped(self):
+        """A code span is emitted literally, so its pipe would split the cell.
+        GFM honours a backslash-escaped pipe inside a code span."""
+        adf = self._doc(
+            {
+                "type": "table",
+                "content": [
+                    {
+                        "type": "tableRow",
+                        "content": [
+                            {
+                                "type": "tableHeader",
+                                "content": [
+                                    self._para(self._text("a|b", [{"type": "code"}]))
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+        assert source._adf_to_markdown(adf).startswith("| `a\\|b` |")
 
     def test_empty_and_non_dict_returns_empty(self):
-        assert source._adf_to_plain_text(None) == ""
-        assert source._adf_to_plain_text("just a string") == ""
-        assert source._adf_to_plain_text({}) == ""
+        assert source._adf_to_markdown(None) == ""
+        assert source._adf_to_markdown("just a string") == ""
+        assert source._adf_to_markdown({}) == ""
 
-    def test_nested_list_structure(self):
-        adf = {
-            "type": "doc",
-            "content": [
-                {
-                    "type": "bulletList",
+    def test_unknown_node_type_still_contributes_its_text(self):
+        adf = self._doc(
+            {"type": "someFutureNode", "content": [self._text("kept")]},
+        )
+        assert source._adf_to_markdown(adf) == "kept"
+
+    def test_traversal_is_depth_limited(self):
+        def nest(levels):
+            node = self._para(self._text("deep"))
+            for _ in range(levels):
+                node = {"type": "blockquote", "content": [node]}
+            return self._doc(node)
+
+        assert "deep" in source._adf_to_markdown(nest(3))
+        assert "deep" not in source._adf_to_markdown(nest(200))
+
+    @staticmethod
+    def _nest(container, levels):
+        """Wrap a 'deep' paragraph in *levels* nested *container* blocks."""
+        node = {"type": "paragraph", "content": [{"type": "text", "text": "deep"}]}
+        for _ in range(levels):
+            if container == "blockquote":
+                node = {"type": "blockquote", "content": [node]}
+            elif container == "taskList":
+                node = {"type": "taskList", "content": [{"type": "taskItem", "content": [node]}]}
+            elif container == "table":
+                node = {
+                    "type": "table",
                     "content": [
                         {
-                            "type": "listItem",
-                            "content": [
-                                {"type": "paragraph", "content": [{"type": "text", "text": "item"}]}
-                            ],
+                            "type": "tableRow",
+                            "content": [{"type": "tableCell", "content": [node]}],
                         }
                     ],
                 }
-            ],
-        }
-        result = source._adf_to_plain_text(adf)
-        assert "item" in result
+            elif container == "someFutureInline":
+                node = {"type": "paragraph", "content": [{"type": "someFutureInline", "content": [node]}]}
+            else:
+                node = {"type": container, "content": [{"type": "listItem", "content": [node]}]}
+        return {"type": "doc", "content": [node]}
+
+    @pytest.mark.parametrize(
+        "container",
+        ["blockquote", "bulletList", "orderedList", "taskList", "table", "someFutureInline"],
+    )
+    def test_every_nesting_container_respects_the_depth_limit(self, container):
+        """No recursing container may reach its renderer past the guarded entry.
+
+        The depth cap lives in `_adf_to_markdown`, so a container whose renderer
+        recursed straight back into the block renderer would skip the cap and
+        exhaust the stack on a deeply nested document.
+        """
+        assert "deep" in source._adf_to_markdown(self._nest(container, 3))
+        assert "deep" not in source._adf_to_markdown(self._nest(container, 350))
+
+    def test_realistic_description_round_trips_to_markdown(self):
+        """One document exercising every structure a Jira description carries."""
+        adf = self._doc(
+            {"type": "heading", "attrs": {"level": 2}, "content": [self._text("Problem")]},
+            self._para(
+                self._text("The "),
+                self._text("fetch_issue", [{"type": "code"}]),
+                self._text(" helper drops "),
+                self._text("every", [{"type": "strong"}]),
+                self._text(" mark."),
+            ),
+            {
+                "type": "bulletList",
+                "content": [
+                    {"type": "listItem", "content": [self._para(self._text("headings"))]},
+                    {
+                        "type": "listItem",
+                        "content": [
+                            self._para(
+                                self._text("links like "),
+                                self._text(
+                                    "the docs",
+                                    [
+                                        {
+                                            "type": "link",
+                                            "attrs": {"href": "https://example.com/docs"},
+                                        }
+                                    ],
+                                ),
+                            )
+                        ],
+                    },
+                ],
+            },
+            {
+                "type": "codeBlock",
+                "attrs": {"language": "python"},
+                "content": [self._text("x = 1")],
+            },
+            {
+                "type": "table",
+                "content": [
+                    {
+                        "type": "tableRow",
+                        "content": [
+                            {"type": "tableHeader", "content": [self._para(self._text("a"))]},
+                            {"type": "tableHeader", "content": [self._para(self._text("b"))]},
+                        ],
+                    },
+                    {
+                        "type": "tableRow",
+                        "content": [
+                            {"type": "tableCell", "content": [self._para(self._text("1"))]},
+                            {"type": "tableCell", "content": [self._para(self._text("2"))]},
+                        ],
+                    },
+                ],
+            },
+            {"type": "rule"},
+            self._para(self._text("See "), {"type": "mention", "attrs": {"text": "Alice"}}),
+        )
+        expected = "\n".join(
+            [
+                "## Problem",
+                "",
+                "The `fetch_issue` helper drops **every** mark.",
+                "",
+                "- headings",
+                "- links like [the docs](https://example.com/docs)",
+                "",
+                "```python",
+                "x = 1",
+                "```",
+                "",
+                "| a | b |",
+                "| --- | --- |",
+                "| 1 | 2 |",
+                "",
+                "---",
+                "",
+                "See @Alice",
+            ]
+        )
+        assert source._adf_to_markdown(adf) == expected
 
 
 class TestGetJiraAuth:
